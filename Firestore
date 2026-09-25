@@ -1,0 +1,126 @@
+rules_version = '2';
+
+// =====================================================================
+// RÈGLES DE SÉCURITÉ FIRESTORE — BOUTIQUE ANICETTE
+// À copier dans : Firebase Console > Firestore Database > Règles > Publier
+// =====================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Fonctions utilitaires ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function hasProfile() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function myRole() {
+      return hasProfile() ? myProfile().role : null;
+    }
+    function myShop() {
+      return hasProfile() ? myProfile().shopId : null;
+    }
+    function isAdmin() {
+      return myRole() == 'admin';
+    }
+    function isAccountant() {
+      return myRole() == 'accountant';
+    }
+    function isActive() {
+      return hasProfile() && myProfile().active != false;
+    }
+    // Vrai tant qu'aucun administrateur n'a encore été créé (voir /meta/appMeta).
+    function noAdminYet() {
+      return !exists(/databases/$(database)/documents/meta/appMeta)
+             || get(/databases/$(database)/documents/meta/appMeta).data.adminCreated != true;
+    }
+
+    // ---------------- META (indicateur de bootstrap) ----------------
+    match /meta/appMeta {
+      allow read: if true;
+      // Ne peut être écrit que pour passer de "pas d'admin" à "admin créé", une seule fois.
+      allow create, update: if isSignedIn() && noAdminYet() && request.resource.data.adminCreated == true;
+    }
+
+    // ---------------- USERS ----------------
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin() || noAdminYet();
+      // Cas 1 : bootstrap — un tout premier admin peut créer SON PROPRE profil.
+      // Cas 2 : un admin déjà authentifié peut créer le profil de n'importe quel utilisateur.
+      allow create: if (noAdminYet() && request.auth.uid == userId && request.resource.data.role == 'admin')
+                       || isAdmin();
+      allow update: if isAdmin() || (isSignedIn() && request.auth.uid == userId
+                        && request.resource.data.role == resource.data.role
+                        && request.resource.data.active == resource.data.active);
+      allow delete: if false;
+    }
+
+    // ---------------- SHOPS ----------------
+    match /shops/{shopId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------------- PRODUCTS ----------------
+    match /products/{productId} {
+      allow read: if isSignedIn();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        // Entrée de stock par le comptable : ne touche pas nom/code/prix de vente.
+        isAccountant() && isActive() && resource.data.shopId == myShop() &&
+        request.resource.data.name == resource.data.name &&
+        request.resource.data.code == resource.data.code &&
+        request.resource.data.salePrice == resource.data.salePrice
+      ) || (
+        // Décrément de stock lors d'une vente, par un utilisateur actif de la même boutique.
+        isActive() && resource.data.shopId == myShop() &&
+        request.resource.data.name == resource.data.name &&
+        request.resource.data.code == resource.data.code &&
+        request.resource.data.salePrice == resource.data.salePrice &&
+        request.resource.data.costPrice == resource.data.costPrice &&
+        request.resource.data.qty <= resource.data.qty
+      );
+    }
+
+    // ---------------- STOCK MOVEMENTS ----------------
+    match /stockMovements/{id} {
+      allow read: if isSignedIn();
+      allow create: if isActive() && (isAdmin() || isAccountant());
+      allow update, delete: if false;
+    }
+
+    // ---------------- SALES ----------------
+    match /sales/{id} {
+      allow read: if isAdmin() || isAccountant() ||
+                     (isSignedIn() && resource.data.sellerId == request.auth.uid);
+      allow create: if isActive() && request.resource.data.sellerId == request.auth.uid
+                       && (isAdmin() || request.resource.data.shopId == myShop());
+      allow update, delete: if false;
+    }
+
+    // ---------------- CASH REMITTANCES ----------------
+    match /cashRemittances/{id} {
+      allow read: if isAdmin() || isAccountant() ||
+                     (isSignedIn() && resource.data.sellerId == request.auth.uid);
+      allow create: if isActive() && request.resource.data.sellerId == request.auth.uid
+                       && (isAdmin() || request.resource.data.shopId == myShop());
+      allow update, delete: if false;
+    }
+
+    // ---------------- AUDIT LOGS ----------------
+    match /auditLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    // ---------------- COUNTERS (numérotation des reçus) ----------------
+    match /counters/{id} {
+      allow read, write: if isActive();
+    }
+  }
+}
